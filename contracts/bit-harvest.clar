@@ -1,4 +1,4 @@
-;; Title: BitHarvest - Bitcoin-Native DeFi Aggregation Platform
+;; Title: BitHarvest - Bitcoin-Native DeFi Aggregation Platform (Security Enhanced)
 
 ;; SUMMARY
 ;; BitHarvest is a comprehensive DeFi aggregation layer for Stacks that enables users
@@ -7,7 +7,6 @@
 ;; maintaining compatibility with Bitcoin's security model.
 
 ;; Error Constants
-
 (define-constant ERR-NOT-AUTHORIZED (err u100))
 (define-constant ERR-INVALID-PROTOCOL (err u101))
 (define-constant ERR-INSUFFICIENT-FUNDS (err u102))
@@ -21,11 +20,23 @@
 (define-constant ERR-VAULT-FULL (err u110))
 (define-constant ERR-SLIPPAGE-TOO-HIGH (err u111))
 (define-constant ERR-UNSUPPORTED-TOKEN (err u112))
+(define-constant ERR-INVALID-STRING (err u113))
+(define-constant ERR-CONTRACT-LOCKED (err u114))
+
+;; Constants for validation
+(define-constant MAX-STRING-LENGTH u64)
+(define-constant MAX-DESCRIPTION-LENGTH u256)
+(define-constant MAX-SHORT-STRING-LENGTH u32)
+(define-constant MAX-PROTOCOL-COUNT u100)
+(define-constant MAX-VAULT-COUNT u1000)
+(define-constant MIN-AMOUNT u1)
+(define-constant MAX-PERCENTAGE u100)
+(define-constant MAX-RISK-LEVEL u10)
+(define-constant MIN-RISK-LEVEL u1)
 
 ;; Data Maps & Variables
-
-;; Track the contract owner
 (define-data-var contract-owner principal tx-sender)
+(define-data-var contract-initialized bool false)
 
 ;; Protocol registry
 (define-map protocols
@@ -36,7 +47,7 @@
     is-active: bool,
     trusted: bool,
     supported-tokens: (list 10 (string-ascii 32)),
-    protocol-type: (string-ascii 32), ;; lending, dex, farm, etc.
+    protocol-type: (string-ascii 32)
   }
 )
 
@@ -49,59 +60,35 @@
     description: (string-ascii 256),
     strategy: (string-ascii 32),
     target-apy: uint,
-    risk-level: uint, ;; 1-10, where 10 is highest risk
-    allocation: (list 10 {
-      protocol-id: uint,
-      percentage: uint,
-    }),
+    risk-level: uint,
+    allocation: (list 10 {protocol-id: uint, percentage: uint}),
     is-active: bool,
     total-assets-ustx: uint,
-    creation-height: uint,
+    creation-height: uint
   }
 )
 
 ;; User positions in vaults
 (define-map user-vault-positions
-  {
-    user: principal,
-    vault-id: uint,
-  }
+  { user: principal, vault-id: uint }
   {
     amount-ustx: uint,
     entry-height: uint,
     last-rebalance-height: uint,
     earnings-ustx: uint,
-    strategy-params: (optional {
-      key: (string-ascii 32),
-      value: uint,
-    }),
+    strategy-params: (optional (tuple (key (string-ascii 32)) (value uint)))
   }
 )
 
 ;; User positions across protocols (portfolio tracker)
 (define-map user-protocol-positions
+  { user: principal, protocol-id: uint }
   {
-    user: principal,
-    protocol-id: uint,
-  }
-  {
-    supplied-assets: (list 5 {
-      token: (string-ascii 32),
-      amount: uint,
-    }),
-    borrowed-assets: (list 5 {
-      token: (string-ascii 32),
-      amount: uint,
-    }),
-    liquidity-positions: (list 5 {
-      pool-id: (string-ascii 32),
-      amount: uint,
-    }),
-    staked-positions: (list 5 {
-      asset: (string-ascii 32),
-      amount: uint,
-    }),
-    last-updated-height: uint,
+    supplied-assets: (list 5 {token: (string-ascii 32), amount: uint}),
+    borrowed-assets: (list 5 {token: (string-ascii 32), amount: uint}),
+    liquidity-positions: (list 5 {pool-id: (string-ascii 32), amount: uint}),
+    staked-positions: (list 5 {asset: (string-ascii 32), amount: uint}),
+    last-updated-height: uint
   }
 )
 
@@ -109,10 +96,10 @@
 (define-map protocol-risk-params
   { protocol-id: uint }
   {
-    liquidation-threshold: uint, ;; percentage (e.g., 75 = 75%)
-    max-ltv: uint, ;; percentage
-    liquidation-penalty: uint, ;; percentage
-    oracle-address: principal,
+    liquidation-threshold: uint,
+    max-ltv: uint,
+    liquidation-penalty: uint,
+    oracle-address: principal
   }
 )
 
@@ -120,10 +107,10 @@
 (define-map user-risk-settings
   { user: principal }
   {
-    liquidation-alert-threshold: uint, ;; percentage buffer above liquidation (e.g., 5 = 5%)
-    rebalance-threshold: uint, ;; percentage deviation from target allocation
-    max-slippage: uint, ;; percentage
-    notification-enabled: bool,
+    liquidation-alert-threshold: uint,
+    rebalance-threshold: uint,
+    max-slippage: uint,
+    notification-enabled: bool
   }
 )
 
@@ -131,13 +118,138 @@
 (define-data-var next-protocol-id uint u1)
 (define-data-var next-vault-id uint u1)
 
-;; Events
-(define-trait event-trait (
-  (emit-event
-    ((string-ascii 64) (string-ascii 256))
-    (response bool uint)
+;; Input validation functions
+
+;; Validate string length and content
+(define-private (is-valid-string (input (string-ascii 64)))
+  (and 
+    (> (len input) u0)
+    (<= (len input) MAX-STRING-LENGTH)
   )
-))
+)
+
+;; Validate short string
+(define-private (is-valid-short-string (input (string-ascii 32)))
+  (and 
+    (> (len input) u0)
+    (<= (len input) MAX-SHORT-STRING-LENGTH)
+  )
+)
+
+;; Validate description string
+(define-private (is-valid-description (input (string-ascii 256)))
+  (and 
+    (> (len input) u0)
+    (<= (len input) MAX-DESCRIPTION-LENGTH)
+  )
+)
+
+;; Validate amount is within reasonable bounds
+(define-private (is-valid-amount (amount uint))
+  (and 
+    (>= amount MIN-AMOUNT)
+    (<= amount u340282366920938463463374607431768211455) ;; max uint
+  )
+)
+
+;; Validate percentage is 0-100
+(define-private (is-valid-percentage (percentage uint))
+  (<= percentage MAX-PERCENTAGE)
+)
+
+;; Validate risk level is 1-10
+(define-private (is-valid-risk-level (risk-level uint))
+  (and 
+    (>= risk-level MIN-RISK-LEVEL)
+    (<= risk-level MAX-RISK-LEVEL)
+  )
+)
+
+;; Validate protocol ID exists and is within bounds
+(define-private (is-valid-protocol-id (protocol-id uint))
+  (and 
+    (> protocol-id u0)
+    (< protocol-id (var-get next-protocol-id))
+  )
+)
+
+;; Validate vault ID exists and is within bounds
+(define-private (is-valid-vault-id (vault-id uint))
+  (and 
+    (> vault-id u0)
+    (< vault-id (var-get next-vault-id))
+  )
+)
+
+;; Validate principal is not zero address
+(define-private (is-valid-principal (addr principal))
+  (not (is-eq addr 'SP000000000000000000002Q6VF78))
+)
+
+;; Validate token list
+(define-private (is-valid-token-list (tokens (list 10 (string-ascii 32))))
+  (and 
+    (> (len tokens) u0)
+    (<= (len tokens) u10)
+    (validate-all-tokens tokens)
+  )
+)
+
+;; Helper to validate all tokens in list
+(define-private (validate-all-tokens (tokens (list 10 (string-ascii 32))))
+  (fold validate-token-and tokens true)
+)
+
+;; Validate single token and combine with previous result
+(define-private (validate-token-and (token (string-ascii 32)) (prev-valid bool))
+  (and prev-valid (is-valid-short-string token))
+)
+
+;; Additional validation helper functions needed
+(define-private (validate-asset-entry (entry {token: (string-ascii 32), amount: uint}))
+  (and 
+    (is-valid-short-string (get token entry))
+    (is-valid-amount (get amount entry))
+  )
+)
+
+(define-private (validate-pool-entry (entry {pool-id: (string-ascii 32), amount: uint}))
+  (and 
+    (is-valid-short-string (get pool-id entry))
+    (is-valid-amount (get amount entry))
+  )
+)
+
+(define-private (validate-stake-entry (entry {asset: (string-ascii 32), amount: uint}))
+  (and 
+    (is-valid-short-string (get asset entry))
+    (is-valid-amount (get amount entry))
+  )
+)
+
+(define-private (validate-asset-list (assets (list 5 {token: (string-ascii 32), amount: uint})))
+  (fold validate-asset-and assets true)
+)
+
+(define-private (validate-asset-and (entry {token: (string-ascii 32), amount: uint}) (prev-valid bool))
+  (and prev-valid (validate-asset-entry entry))
+)
+
+(define-private (validate-pool-list (pools (list 5 {pool-id: (string-ascii 32), amount: uint})))
+  (fold validate-pool-and pools true)
+)
+
+(define-private (validate-pool-and (entry {pool-id: (string-ascii 32), amount: uint}) (prev-valid bool))
+  (and prev-valid (validate-pool-entry entry))
+)
+
+(define-private (validate-stake-list (stakes (list 5 {asset: (string-ascii 32), amount: uint})))
+  (fold validate-stake-and stakes true)
+)
+
+(define-private (validate-stake-and (entry {asset: (string-ascii 32), amount: uint}) (prev-valid bool))
+  (and prev-valid (validate-stake-entry entry))
+)
 
 ;; Admin Functions
 
@@ -145,48 +257,61 @@
 (define-public (initialize (owner principal))
   (begin
     (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+    (asserts! (not (var-get contract-initialized)) ERR-CONTRACT-LOCKED)
+    (asserts! (is-valid-principal owner) ERR-INVALID-PARAMETER)
+    
     (var-set contract-owner owner)
+    (var-set contract-initialized true)
     (ok true)
   )
 )
 
 ;; Add a new protocol to the registry
-(define-public (register-protocol
-    (name (string-ascii 64))
-    (protocol-address principal)
-    (supported-tokens (list 10 (string-ascii 32)))
-    (protocol-type (string-ascii 32))
-  )
-  (let ((protocol-id (var-get next-protocol-id)))
+(define-public (register-protocol 
+                (name (string-ascii 64)) 
+                (protocol-address principal) 
+                (supported-tokens (list 10 (string-ascii 32))) 
+                (protocol-type (string-ascii 32)))
+  (let
+    (
+      (protocol-id (var-get next-protocol-id))
+    )
+    ;; Enhanced validation
     (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
-    (map-set protocols { protocol-id: protocol-id } {
-      name: name,
-      protocol-address: protocol-address,
-      is-active: true,
-      trusted: true,
-      supported-tokens: supported-tokens,
-      protocol-type: protocol-type,
-    })
+    (asserts! (is-valid-string name) ERR-INVALID-STRING)
+    (asserts! (is-valid-principal protocol-address) ERR-INVALID-PARAMETER)
+    (asserts! (is-valid-token-list supported-tokens) ERR-INVALID-PARAMETER)
+    (asserts! (is-valid-short-string protocol-type) ERR-INVALID-STRING)
+    (asserts! (< protocol-id MAX-PROTOCOL-COUNT) ERR-INVALID-PARAMETER)
+    
+    (map-set protocols
+      { protocol-id: protocol-id }
+      {
+        name: name,
+        protocol-address: protocol-address,
+        is-active: true,
+        trusted: true,
+        supported-tokens: supported-tokens,
+        protocol-type: protocol-type
+      }
+    )
     (var-set next-protocol-id (+ protocol-id u1))
     (ok protocol-id)
   )
 )
 
 ;; Update protocol status (activate/deactivate)
-(define-public (update-protocol-status
-    (protocol-id uint)
-    (is-active bool)
-    (trusted bool)
-  )
-  (let ((protocol (unwrap! (map-get? protocols { protocol-id: protocol-id })
-      ERR-PROTOCOL-NOT-REGISTERED
-    )))
+(define-public (update-protocol-status (protocol-id uint) (is-active bool) (trusted bool))
+  (let
+    (
+      (protocol (unwrap! (map-get? protocols { protocol-id: protocol-id }) ERR-PROTOCOL-NOT-REGISTERED))
+    )
     (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
-    (map-set protocols { protocol-id: protocol-id }
-      (merge protocol {
-        is-active: is-active,
-        trusted: trusted,
-      })
+    (asserts! (is-valid-protocol-id protocol-id) ERR-INVALID-PARAMETER)
+    
+    (map-set protocols
+      { protocol-id: protocol-id }
+      (merge protocol { is-active: is-active, trusted: trusted })
     )
     (ok true)
   )
@@ -194,26 +319,30 @@
 
 ;; Set risk parameters for a lending protocol
 (define-public (set-protocol-risk-params
-    (protocol-id uint)
-    (liquidation-threshold uint)
-    (max-ltv uint)
-    (liquidation-penalty uint)
-    (oracle-address principal)
-  )
+                (protocol-id uint)
+                (liquidation-threshold uint)
+                (max-ltv uint)
+                (liquidation-penalty uint)
+                (oracle-address principal))
   (begin
     (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
-    (asserts! (is-some (map-get? protocols { protocol-id: protocol-id }))
-      ERR-PROTOCOL-NOT-REGISTERED
-    )
-    (asserts! (<= liquidation-threshold u100) ERR-INVALID-PARAMETER)
+    (asserts! (is-valid-protocol-id protocol-id) ERR-INVALID-PARAMETER)
+    (asserts! (is-some (map-get? protocols { protocol-id: protocol-id })) ERR-PROTOCOL-NOT-REGISTERED)
+    (asserts! (is-valid-percentage liquidation-threshold) ERR-INVALID-PARAMETER)
+    (asserts! (is-valid-percentage max-ltv) ERR-INVALID-PARAMETER)
+    (asserts! (is-valid-percentage liquidation-penalty) ERR-INVALID-PARAMETER)
     (asserts! (<= max-ltv liquidation-threshold) ERR-INVALID-PARAMETER)
-    (asserts! (<= liquidation-penalty u100) ERR-INVALID-PARAMETER)
-    (map-set protocol-risk-params { protocol-id: protocol-id } {
-      liquidation-threshold: liquidation-threshold,
-      max-ltv: max-ltv,
-      liquidation-penalty: liquidation-penalty,
-      oracle-address: oracle-address,
-    })
+    (asserts! (is-valid-principal oracle-address) ERR-INVALID-PARAMETER)
+    
+    (map-set protocol-risk-params
+      { protocol-id: protocol-id }
+      {
+        liquidation-threshold: liquidation-threshold,
+        max-ltv: max-ltv,
+        liquidation-penalty: liquidation-penalty,
+        oracle-address: oracle-address
+      }
+    )
     (ok true)
   )
 )
@@ -222,123 +351,132 @@
 
 ;; Create a new yield optimization vault
 (define-public (create-vault
-    (name (string-ascii 64))
-    (description (string-ascii 256))
-    (strategy (string-ascii 32))
-    (target-apy uint)
-    (risk-level uint)
-    (allocation (list 10 {
-      protocol-id: uint,
-      percentage: uint,
-    }))
-  )
-  (let (
+                (name (string-ascii 64))
+                (description (string-ascii 256))
+                (strategy (string-ascii 32))
+                (target-apy uint)
+                (risk-level uint)
+                (allocation (list 10 {protocol-id: uint, percentage: uint})))
+  (let
+    (
       (vault-id (var-get next-vault-id))
       (total-percentage (fold + (map get-percentage allocation) u0))
     )
-    ;; Validate input parameters
-    (asserts! (and (>= risk-level u1) (<= risk-level u10)) ERR-INVALID-PARAMETER)
+    ;; Enhanced validation
+    (asserts! (is-valid-string name) ERR-INVALID-STRING)
+    (asserts! (is-valid-description description) ERR-INVALID-STRING)
+    (asserts! (is-valid-short-string strategy) ERR-INVALID-STRING)
+    (asserts! (> target-apy u0) ERR-INVALID-PARAMETER)
+    (asserts! (is-valid-risk-level risk-level) ERR-INVALID-PARAMETER)
     (asserts! (is-eq total-percentage u100) ERR-INVALID-PARAMETER)
-    ;; Check all protocols in allocation exist and are active
+    (asserts! (< vault-id MAX-VAULT-COUNT) ERR-INVALID-PARAMETER)
+    (asserts! (> (len allocation) u0) ERR-INVALID-PARAMETER)
+    
+    ;; Validate allocation structure and protocols
     (asserts! (validate-allocation allocation) ERR-INVALID-PROTOCOL)
-    ;; Create the vault
-    (map-set vaults { vault-id: vault-id } {
-      creator: tx-sender,
-      name: name,
-      description: description,
-      strategy: strategy,
-      target-apy: target-apy,
-      risk-level: risk-level,
-      allocation: allocation,
-      is-active: true,
-      total-assets-ustx: u0,
-      creation-height: stacks-block-height,
-    })
+    
+    (map-set vaults
+      { vault-id: vault-id }
+      {
+        creator: tx-sender,
+        name: name,
+        description: description,
+        strategy: strategy,
+        target-apy: target-apy,
+        risk-level: risk-level,
+        allocation: allocation,
+        is-active: true,
+        total-assets-ustx: u0,
+        creation-height: stacks-block-height
+      }
+    )
     (var-set next-vault-id (+ vault-id u1))
     (ok vault-id)
   )
 )
 
 ;; Deposit assets into a vault
-(define-public (deposit-to-vault
-    (vault-id uint)
-    (amount-ustx uint)
-  )
-  (let (
+(define-public (deposit-to-vault (vault-id uint) (amount-ustx uint))
+  (let
+    (
       (vault (unwrap! (map-get? vaults { vault-id: vault-id }) ERR-VAULT-NOT-FOUND))
-      (user-position (default-to {
-        amount-ustx: u0,
-        entry-height: stacks-block-height,
-        last-rebalance-height: stacks-block-height,
-        earnings-ustx: u0,
-        strategy-params: none,
-      }
-        (map-get? user-vault-positions {
-          user: tx-sender,
-          vault-id: vault-id,
-        })
-      ))
+      (user-position (default-to 
+                       {
+                         amount-ustx: u0,
+                         entry-height: stacks-block-height,
+                         last-rebalance-height: stacks-block-height,
+                         earnings-ustx: u0,
+                         strategy-params: none
+                       }
+                       (map-get? user-vault-positions { user: tx-sender, vault-id: vault-id })))
     )
-    ;; Validate
+    ;; Enhanced validation
+    (asserts! (is-valid-vault-id vault-id) ERR-INVALID-PARAMETER)
+    (asserts! (is-valid-amount amount-ustx) ERR-INVALID-AMOUNT)
     (asserts! (get is-active vault) ERR-VAULT-NOT-FOUND)
-    (asserts! (> amount-ustx u0) ERR-INVALID-AMOUNT)
+    
     ;; Transfer STX to contract
     (try! (stx-transfer? amount-ustx tx-sender (as-contract tx-sender)))
+    
     ;; Update user position
-    (map-set user-vault-positions {
-      user: tx-sender,
-      vault-id: vault-id,
-    }
-      (merge user-position {
+    (map-set user-vault-positions
+      { user: tx-sender, vault-id: vault-id }
+      (merge user-position { 
         amount-ustx: (+ (get amount-ustx user-position) amount-ustx),
-        last-rebalance-height: stacks-block-height,
+        last-rebalance-height: stacks-block-height
       })
     )
+    
     ;; Update vault total assets
-    (map-set vaults { vault-id: vault-id }
-      (merge vault { total-assets-ustx: (+ (get total-assets-ustx vault) amount-ustx) })
+    (map-set vaults
+      { vault-id: vault-id }
+      (merge vault { 
+        total-assets-ustx: (+ (get total-assets-ustx vault) amount-ustx) 
+      })
     )
+    
     ;; Allocate funds according to vault strategy
     (try! (allocate-funds vault-id tx-sender amount-ustx))
+    
     (ok true)
   )
 )
 
 ;; Withdraw assets from a vault
-(define-public (withdraw-from-vault
-    (vault-id uint)
-    (amount-ustx uint)
-  )
-  (let (
+(define-public (withdraw-from-vault (vault-id uint) (amount-ustx uint))
+  (let
+    (
       (vault (unwrap! (map-get? vaults { vault-id: vault-id }) ERR-VAULT-NOT-FOUND))
-      (user-position (unwrap!
-        (map-get? user-vault-positions {
-          user: tx-sender,
-          vault-id: vault-id,
-        })
-        ERR-POSITION-NOT-FOUND
-      ))
+      (user-position (unwrap! (map-get? user-vault-positions { user: tx-sender, vault-id: vault-id }) ERR-POSITION-NOT-FOUND))
     )
-    ;; Validate
+    ;; Enhanced validation
+    (asserts! (is-valid-vault-id vault-id) ERR-INVALID-PARAMETER)
+    (asserts! (is-valid-amount amount-ustx) ERR-INVALID-AMOUNT)
     (asserts! (get is-active vault) ERR-VAULT-NOT-FOUND)
-    (asserts! (>= (get amount-ustx user-position) amount-ustx)
-      ERR-INSUFFICIENT-FUNDS
-    )
+    (asserts! (>= (get amount-ustx user-position) amount-ustx) ERR-INSUFFICIENT-FUNDS)
+    
     ;; Withdraw from protocols according to allocation
     (try! (deallocate-funds vault-id tx-sender amount-ustx))
+    
     ;; Update user position
-    (map-set user-vault-positions {
-      user: tx-sender,
-      vault-id: vault-id,
-    }
-      (merge user-position { amount-ustx: (- (get amount-ustx user-position) amount-ustx) })
+    (map-set user-vault-positions
+      { user: tx-sender, vault-id: vault-id }
+      (merge user-position { 
+        amount-ustx: (- (get amount-ustx user-position) amount-ustx)
+      })
     )
+    
     ;; Update vault total assets
-    (map-set vaults { vault-id: vault-id }
-      (merge vault { total-assets-ustx: (- (get total-assets-ustx vault) amount-ustx) })
+    (map-set vaults
+      { vault-id: vault-id }
+      (merge vault { 
+        total-assets-ustx: (- (get total-assets-ustx vault) amount-ustx) 
+      })
     )
+    
     ;; Transfer STX to user
     (try! (as-contract (stx-transfer? amount-ustx tx-sender tx-sender)))
+    
     (ok true)
   )
 )
@@ -518,39 +656,30 @@
 )
 
 ;; Check if a user's position needs liquidation alert
-(define-public (check-liquidation-risk
-    (user principal)
-    (protocol-id uint)
-  )
-  (let (
-      (protocol (unwrap! (map-get? protocols { protocol-id: protocol-id })
-        ERR-PROTOCOL-NOT-REGISTERED
-      ))
-      (risk-params (unwrap! (map-get? protocol-risk-params { protocol-id: protocol-id })
-        ERR-PROTOCOL-NOT-REGISTERED
-      ))
-      (user-settings (default-to {
-        liquidation-alert-threshold: u5,
-        rebalance-threshold: u10,
-        max-slippage: u5,
-        notification-enabled: true,
-      }
-        (map-get? user-risk-settings { user: user })
-      ))
-      ;; This would be calculated based on actual position data from the protocol
+(define-public (check-liquidation-risk (user principal) (protocol-id uint))
+  (let
+    (
+      (protocol (unwrap! (map-get? protocols { protocol-id: protocol-id }) ERR-PROTOCOL-NOT-REGISTERED))
+      (risk-params (unwrap! (map-get? protocol-risk-params { protocol-id: protocol-id }) ERR-PROTOCOL-NOT-REGISTERED))
+      (user-settings (default-to 
+                      {
+                        liquidation-alert-threshold: u5,
+                        rebalance-threshold: u10,
+                        max-slippage: u5,
+                        notification-enabled: true
+                      }
+                      (map-get? user-risk-settings { user: user })))
       (current-ltv (mock-get-current-ltv user protocol-id))
       (liquidation-threshold (get liquidation-threshold risk-params))
       (alert-threshold (- liquidation-threshold (get liquidation-alert-threshold user-settings)))
     )
+    ;; Enhanced validation
+    (asserts! (is-valid-principal user) ERR-INVALID-PARAMETER)
+    (asserts! (is-valid-protocol-id protocol-id) ERR-INVALID-PARAMETER)
+    
     (if (>= current-ltv alert-threshold)
       (begin
-        (print {
-          event: "liquidation-alert",
-          user: user,
-          protocol-id: protocol-id,
-          current-ltv: current-ltv,
-          threshold: alert-threshold,
-        })
+        (print {event: "liquidation-alert", user: user, protocol-id: protocol-id, current-ltv: current-ltv, threshold: alert-threshold})
         (ok true)
       )
       (ok false)
@@ -593,27 +722,13 @@
 ;; Update a user's position in a protocol
 (define-public (update-protocol-position
     (protocol-id uint)
-    (supplied-assets (list 5 {
-      token: (string-ascii 32),
-      amount: uint,
-    }))
-    (borrowed-assets (list 5 {
-      token: (string-ascii 32),
-      amount: uint,
-    }))
-    (liquidity-positions (list 5 {
-      pool-id: (string-ascii 32),
-      amount: uint,
-    }))
-    (staked-positions (list 5 {
-      asset: (string-ascii 32),
-      amount: uint,
-    }))
+    (supplied-assets (list 5 {token: (string-ascii 32), amount: uint}))
+    (borrowed-assets (list 5 {token: (string-ascii 32), amount: uint}))
+    (liquidity-positions (list 5 {pool-id: (string-ascii 32), amount: uint}))
+    (staked-positions (list 5 {asset: (string-ascii 32), amount: uint}))
   )
   (let (
-      (protocol (unwrap! (map-get? protocols { protocol-id: protocol-id })
-        ERR-PROTOCOL-NOT-REGISTERED
-      ))
+      (protocol (unwrap! (map-get? protocols { protocol-id: protocol-id }) ERR-PROTOCOL-NOT-REGISTERED))
       (current-position (default-to {
         supplied-assets: (list),
         borrowed-assets: (list),
@@ -627,7 +742,14 @@
         })
       ))
     )
+    ;; Enhanced validation for all input parameters
+    (asserts! (is-valid-protocol-id protocol-id) ERR-INVALID-PARAMETER)
     (asserts! (get is-active protocol) ERR-INVALID-PROTOCOL)
+    (asserts! (validate-asset-list supplied-assets) ERR-INVALID-PARAMETER)
+    (asserts! (validate-asset-list borrowed-assets) ERR-INVALID-PARAMETER)
+    (asserts! (validate-pool-list liquidity-positions) ERR-INVALID-PARAMETER)
+    (asserts! (validate-stake-list staked-positions) ERR-INVALID-PARAMETER)
+    
     (map-set user-protocol-positions {
       user: tx-sender,
       protocol-id: protocol-id,
