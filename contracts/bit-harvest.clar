@@ -493,3 +493,97 @@
     true
   )
 )
+
+;; Risk Management Functions
+
+;; Set user risk preferences
+(define-public (set-risk-preferences
+    (liquidation-alert-threshold uint)
+    (rebalance-threshold uint)
+    (max-slippage uint)
+    (notification-enabled bool)
+  )
+  (begin
+    (asserts! (<= liquidation-alert-threshold u50) ERR-INVALID-PARAMETER)
+    (asserts! (<= rebalance-threshold u50) ERR-INVALID-PARAMETER)
+    (asserts! (<= max-slippage u50) ERR-INVALID-PARAMETER)
+    (map-set user-risk-settings { user: tx-sender } {
+      liquidation-alert-threshold: liquidation-alert-threshold,
+      rebalance-threshold: rebalance-threshold,
+      max-slippage: max-slippage,
+      notification-enabled: notification-enabled,
+    })
+    (ok true)
+  )
+)
+
+;; Check if a user's position needs liquidation alert
+(define-public (check-liquidation-risk
+    (user principal)
+    (protocol-id uint)
+  )
+  (let (
+      (protocol (unwrap! (map-get? protocols { protocol-id: protocol-id })
+        ERR-PROTOCOL-NOT-REGISTERED
+      ))
+      (risk-params (unwrap! (map-get? protocol-risk-params { protocol-id: protocol-id })
+        ERR-PROTOCOL-NOT-REGISTERED
+      ))
+      (user-settings (default-to {
+        liquidation-alert-threshold: u5,
+        rebalance-threshold: u10,
+        max-slippage: u5,
+        notification-enabled: true,
+      }
+        (map-get? user-risk-settings { user: user })
+      ))
+      ;; This would be calculated based on actual position data from the protocol
+      (current-ltv (mock-get-current-ltv user protocol-id))
+      (liquidation-threshold (get liquidation-threshold risk-params))
+      (alert-threshold (- liquidation-threshold (get liquidation-alert-threshold user-settings)))
+    )
+    (if (>= current-ltv alert-threshold)
+      (begin
+        (print {
+          event: "liquidation-alert",
+          user: user,
+          protocol-id: protocol-id,
+          current-ltv: current-ltv,
+          threshold: alert-threshold,
+        })
+        (ok true)
+      )
+      (ok false)
+    )
+  )
+)
+
+;; Mock function to get current LTV for a user (would be replaced with actual protocol calls)
+(define-private (mock-get-current-ltv
+    (user principal)
+    (protocol-id uint)
+  )
+  ;; For demonstration, return a fixed value
+  u70
+  ;; 70% LTV
+)
+
+;; Rebalance a vault based on market conditions
+(define-public (rebalance-vault (vault-id uint))
+  (let ((vault (unwrap! (map-get? vaults { vault-id: vault-id }) ERR-VAULT-NOT-FOUND)))
+    (asserts!
+      (or
+        (is-eq tx-sender (get creator vault))
+        (is-eq tx-sender (var-get contract-owner))
+      )
+      ERR-NOT-AUTHORIZED
+    )
+    ;; Perform the rebalancing logic
+    ;; This would involve withdrawing from underperforming protocols and depositing into better ones
+    (print {
+      event: "rebalance-vault",
+      vault-id: vault-id,
+    })
+    (ok true)
+  )
+)
