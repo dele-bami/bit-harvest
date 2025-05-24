@@ -1,0 +1,893 @@
+;; Title: BitHarvest - Bitcoin-Native DeFi Aggregation Platform (Security Enhanced)
+
+;; SUMMARY
+;; BitHarvest is a comprehensive DeFi aggregation layer for Stacks that enables users
+;; to optimize yield across multiple Bitcoin and Stacks protocols. It provides vault 
+;; strategies, risk management, portfolio tracking, and batch transactions while
+;; maintaining compatibility with Bitcoin's security model.
+
+;; Error Constants
+(define-constant ERR-NOT-AUTHORIZED (err u100))
+(define-constant ERR-INVALID-PROTOCOL (err u101))
+(define-constant ERR-INSUFFICIENT-FUNDS (err u102))
+(define-constant ERR-INVALID-AMOUNT (err u103))
+(define-constant ERR-VAULT-NOT-FOUND (err u104))
+(define-constant ERR-PROTOCOL-NOT-REGISTERED (err u105))
+(define-constant ERR-UNAUTHORIZED-PROTOCOL (err u106))
+(define-constant ERR-INVALID-PARAMETER (err u107))
+(define-constant ERR-POSITION-NOT-FOUND (err u108))
+(define-constant ERR-LIQUIDATION-THRESHOLD (err u109))
+(define-constant ERR-VAULT-FULL (err u110))
+(define-constant ERR-SLIPPAGE-TOO-HIGH (err u111))
+(define-constant ERR-UNSUPPORTED-TOKEN (err u112))
+(define-constant ERR-INVALID-STRING (err u113))
+(define-constant ERR-CONTRACT-LOCKED (err u114))
+
+;; Constants for validation
+(define-constant MAX-STRING-LENGTH u64)
+(define-constant MAX-DESCRIPTION-LENGTH u256)
+(define-constant MAX-SHORT-STRING-LENGTH u32)
+(define-constant MAX-PROTOCOL-COUNT u100)
+(define-constant MAX-VAULT-COUNT u1000)
+(define-constant MIN-AMOUNT u1)
+(define-constant MAX-PERCENTAGE u100)
+(define-constant MAX-RISK-LEVEL u10)
+(define-constant MIN-RISK-LEVEL u1)
+
+;; Data Maps & Variables
+(define-data-var contract-owner principal tx-sender)
+(define-data-var contract-initialized bool false)
+
+;; Protocol registry
+(define-map protocols
+  { protocol-id: uint }
+  {
+    name: (string-ascii 64),
+    protocol-address: principal,
+    is-active: bool,
+    trusted: bool,
+    supported-tokens: (list 10 (string-ascii 32)),
+    protocol-type: (string-ascii 32)
+  }
+)
+
+;; Vault data structure
+(define-map vaults
+  { vault-id: uint }
+  {
+    creator: principal,
+    name: (string-ascii 64),
+    description: (string-ascii 256),
+    strategy: (string-ascii 32),
+    target-apy: uint,
+    risk-level: uint,
+    allocation: (list 10 {protocol-id: uint, percentage: uint}),
+    is-active: bool,
+    total-assets-ustx: uint,
+    creation-height: uint
+  }
+)
+
+;; User positions in vaults
+(define-map user-vault-positions
+  { user: principal, vault-id: uint }
+  {
+    amount-ustx: uint,
+    entry-height: uint,
+    last-rebalance-height: uint,
+    earnings-ustx: uint,
+    strategy-params: (optional (tuple (key (string-ascii 32)) (value uint)))
+  }
+)
+
+;; User positions across protocols (portfolio tracker)
+(define-map user-protocol-positions
+  { user: principal, protocol-id: uint }
+  {
+    supplied-assets: (list 5 {token: (string-ascii 32), amount: uint}),
+    borrowed-assets: (list 5 {token: (string-ascii 32), amount: uint}),
+    liquidity-positions: (list 5 {pool-id: (string-ascii 32), amount: uint}),
+    staked-positions: (list 5 {asset: (string-ascii 32), amount: uint}),
+    last-updated-height: uint
+  }
+)
+
+;; Risk parameters for lending protocols
+(define-map protocol-risk-params
+  { protocol-id: uint }
+  {
+    liquidation-threshold: uint,
+    max-ltv: uint,
+    liquidation-penalty: uint,
+    oracle-address: principal
+  }
+)
+
+;; User risk alert settings
+(define-map user-risk-settings
+  { user: principal }
+  {
+    liquidation-alert-threshold: uint,
+    rebalance-threshold: uint,
+    max-slippage: uint,
+    notification-enabled: bool
+  }
+)
+
+;; Counters for IDs
+(define-data-var next-protocol-id uint u1)
+(define-data-var next-vault-id uint u1)
+
+;; Input validation functions
+
+;; Validate string length and content
+(define-private (is-valid-string (input (string-ascii 64)))
+  (and 
+    (> (len input) u0)
+    (<= (len input) MAX-STRING-LENGTH)
+  )
+)
+
+;; Validate short string
+(define-private (is-valid-short-string (input (string-ascii 32)))
+  (and 
+    (> (len input) u0)
+    (<= (len input) MAX-SHORT-STRING-LENGTH)
+  )
+)
+
+;; Validate description string
+(define-private (is-valid-description (input (string-ascii 256)))
+  (and 
+    (> (len input) u0)
+    (<= (len input) MAX-DESCRIPTION-LENGTH)
+  )
+)
+
+;; Validate amount is within reasonable bounds
+(define-private (is-valid-amount (amount uint))
+  (and 
+    (>= amount MIN-AMOUNT)
+    (<= amount u340282366920938463463374607431768211455) ;; max uint
+  )
+)
+
+;; Validate percentage is 0-100
+(define-private (is-valid-percentage (percentage uint))
+  (<= percentage MAX-PERCENTAGE)
+)
+
+;; Validate risk level is 1-10
+(define-private (is-valid-risk-level (risk-level uint))
+  (and 
+    (>= risk-level MIN-RISK-LEVEL)
+    (<= risk-level MAX-RISK-LEVEL)
+  )
+)
+
+;; Validate protocol ID exists and is within bounds
+(define-private (is-valid-protocol-id (protocol-id uint))
+  (and 
+    (> protocol-id u0)
+    (< protocol-id (var-get next-protocol-id))
+  )
+)
+
+;; Validate vault ID exists and is within bounds
+(define-private (is-valid-vault-id (vault-id uint))
+  (and 
+    (> vault-id u0)
+    (< vault-id (var-get next-vault-id))
+  )
+)
+
+;; Validate principal is not zero address
+(define-private (is-valid-principal (addr principal))
+  (not (is-eq addr 'SP000000000000000000002Q6VF78))
+)
+
+;; Validate token list
+(define-private (is-valid-token-list (tokens (list 10 (string-ascii 32))))
+  (and 
+    (> (len tokens) u0)
+    (<= (len tokens) u10)
+    (validate-all-tokens tokens)
+  )
+)
+
+;; Helper to validate all tokens in list
+(define-private (validate-all-tokens (tokens (list 10 (string-ascii 32))))
+  (fold validate-token-and tokens true)
+)
+
+;; Validate single token and combine with previous result
+(define-private (validate-token-and (token (string-ascii 32)) (prev-valid bool))
+  (and prev-valid (is-valid-short-string token))
+)
+
+;; Additional validation helper functions needed
+(define-private (validate-asset-entry (entry {token: (string-ascii 32), amount: uint}))
+  (and 
+    (is-valid-short-string (get token entry))
+    (is-valid-amount (get amount entry))
+  )
+)
+
+(define-private (validate-pool-entry (entry {pool-id: (string-ascii 32), amount: uint}))
+  (and 
+    (is-valid-short-string (get pool-id entry))
+    (is-valid-amount (get amount entry))
+  )
+)
+
+(define-private (validate-stake-entry (entry {asset: (string-ascii 32), amount: uint}))
+  (and 
+    (is-valid-short-string (get asset entry))
+    (is-valid-amount (get amount entry))
+  )
+)
+
+(define-private (validate-asset-list (assets (list 5 {token: (string-ascii 32), amount: uint})))
+  (fold validate-asset-and assets true)
+)
+
+(define-private (validate-asset-and (entry {token: (string-ascii 32), amount: uint}) (prev-valid bool))
+  (and prev-valid (validate-asset-entry entry))
+)
+
+(define-private (validate-pool-list (pools (list 5 {pool-id: (string-ascii 32), amount: uint})))
+  (fold validate-pool-and pools true)
+)
+
+(define-private (validate-pool-and (entry {pool-id: (string-ascii 32), amount: uint}) (prev-valid bool))
+  (and prev-valid (validate-pool-entry entry))
+)
+
+(define-private (validate-stake-list (stakes (list 5 {asset: (string-ascii 32), amount: uint})))
+  (fold validate-stake-and stakes true)
+)
+
+(define-private (validate-stake-and (entry {asset: (string-ascii 32), amount: uint}) (prev-valid bool))
+  (and prev-valid (validate-stake-entry entry))
+)
+
+;; Admin Functions
+
+;; Initialize contract with the contract owner
+(define-public (initialize (owner principal))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+    (asserts! (not (var-get contract-initialized)) ERR-CONTRACT-LOCKED)
+    (asserts! (is-valid-principal owner) ERR-INVALID-PARAMETER)
+    
+    (var-set contract-owner owner)
+    (var-set contract-initialized true)
+    (ok true)
+  )
+)
+
+;; Add a new protocol to the registry
+(define-public (register-protocol 
+                (name (string-ascii 64)) 
+                (protocol-address principal) 
+                (supported-tokens (list 10 (string-ascii 32))) 
+                (protocol-type (string-ascii 32)))
+  (let
+    (
+      (protocol-id (var-get next-protocol-id))
+    )
+    ;; Enhanced validation
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+    (asserts! (is-valid-string name) ERR-INVALID-STRING)
+    (asserts! (is-valid-principal protocol-address) ERR-INVALID-PARAMETER)
+    (asserts! (is-valid-token-list supported-tokens) ERR-INVALID-PARAMETER)
+    (asserts! (is-valid-short-string protocol-type) ERR-INVALID-STRING)
+    (asserts! (< protocol-id MAX-PROTOCOL-COUNT) ERR-INVALID-PARAMETER)
+    
+    (map-set protocols
+      { protocol-id: protocol-id }
+      {
+        name: name,
+        protocol-address: protocol-address,
+        is-active: true,
+        trusted: true,
+        supported-tokens: supported-tokens,
+        protocol-type: protocol-type
+      }
+    )
+    (var-set next-protocol-id (+ protocol-id u1))
+    (ok protocol-id)
+  )
+)
+
+;; Update protocol status (activate/deactivate)
+(define-public (update-protocol-status (protocol-id uint) (is-active bool) (trusted bool))
+  (let
+    (
+      (protocol (unwrap! (map-get? protocols { protocol-id: protocol-id }) ERR-PROTOCOL-NOT-REGISTERED))
+    )
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+    (asserts! (is-valid-protocol-id protocol-id) ERR-INVALID-PARAMETER)
+    
+    (map-set protocols
+      { protocol-id: protocol-id }
+      (merge protocol { is-active: is-active, trusted: trusted })
+    )
+    (ok true)
+  )
+)
+
+;; Set risk parameters for a lending protocol
+(define-public (set-protocol-risk-params
+                (protocol-id uint)
+                (liquidation-threshold uint)
+                (max-ltv uint)
+                (liquidation-penalty uint)
+                (oracle-address principal))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+    (asserts! (is-valid-protocol-id protocol-id) ERR-INVALID-PARAMETER)
+    (asserts! (is-some (map-get? protocols { protocol-id: protocol-id })) ERR-PROTOCOL-NOT-REGISTERED)
+    (asserts! (is-valid-percentage liquidation-threshold) ERR-INVALID-PARAMETER)
+    (asserts! (is-valid-percentage max-ltv) ERR-INVALID-PARAMETER)
+    (asserts! (is-valid-percentage liquidation-penalty) ERR-INVALID-PARAMETER)
+    (asserts! (<= max-ltv liquidation-threshold) ERR-INVALID-PARAMETER)
+    (asserts! (is-valid-principal oracle-address) ERR-INVALID-PARAMETER)
+    
+    (map-set protocol-risk-params
+      { protocol-id: protocol-id }
+      {
+        liquidation-threshold: liquidation-threshold,
+        max-ltv: max-ltv,
+        liquidation-penalty: liquidation-penalty,
+        oracle-address: oracle-address
+      }
+    )
+    (ok true)
+  )
+)
+
+;; Vault Functions
+
+;; Create a new yield optimization vault
+(define-public (create-vault
+                (name (string-ascii 64))
+                (description (string-ascii 256))
+                (strategy (string-ascii 32))
+                (target-apy uint)
+                (risk-level uint)
+                (allocation (list 10 {protocol-id: uint, percentage: uint})))
+  (let
+    (
+      (vault-id (var-get next-vault-id))
+      (total-percentage (fold + (map get-percentage allocation) u0))
+    )
+    ;; Enhanced validation
+    (asserts! (is-valid-string name) ERR-INVALID-STRING)
+    (asserts! (is-valid-description description) ERR-INVALID-STRING)
+    (asserts! (is-valid-short-string strategy) ERR-INVALID-STRING)
+    (asserts! (> target-apy u0) ERR-INVALID-PARAMETER)
+    (asserts! (is-valid-risk-level risk-level) ERR-INVALID-PARAMETER)
+    (asserts! (is-eq total-percentage u100) ERR-INVALID-PARAMETER)
+    (asserts! (< vault-id MAX-VAULT-COUNT) ERR-INVALID-PARAMETER)
+    (asserts! (> (len allocation) u0) ERR-INVALID-PARAMETER)
+    
+    ;; Validate allocation structure and protocols
+    (asserts! (validate-allocation allocation) ERR-INVALID-PROTOCOL)
+    
+    (map-set vaults
+      { vault-id: vault-id }
+      {
+        creator: tx-sender,
+        name: name,
+        description: description,
+        strategy: strategy,
+        target-apy: target-apy,
+        risk-level: risk-level,
+        allocation: allocation,
+        is-active: true,
+        total-assets-ustx: u0,
+        creation-height: stacks-block-height
+      }
+    )
+    (var-set next-vault-id (+ vault-id u1))
+    (ok vault-id)
+  )
+)
+
+;; Deposit assets into a vault
+(define-public (deposit-to-vault (vault-id uint) (amount-ustx uint))
+  (let
+    (
+      (vault (unwrap! (map-get? vaults { vault-id: vault-id }) ERR-VAULT-NOT-FOUND))
+      (user-position (default-to 
+                       {
+                         amount-ustx: u0,
+                         entry-height: stacks-block-height,
+                         last-rebalance-height: stacks-block-height,
+                         earnings-ustx: u0,
+                         strategy-params: none
+                       }
+                       (map-get? user-vault-positions { user: tx-sender, vault-id: vault-id })))
+    )
+    ;; Enhanced validation
+    (asserts! (is-valid-vault-id vault-id) ERR-INVALID-PARAMETER)
+    (asserts! (is-valid-amount amount-ustx) ERR-INVALID-AMOUNT)
+    (asserts! (get is-active vault) ERR-VAULT-NOT-FOUND)
+    
+    ;; Transfer STX to contract
+    (try! (stx-transfer? amount-ustx tx-sender (as-contract tx-sender)))
+    
+    ;; Update user position
+    (map-set user-vault-positions
+      { user: tx-sender, vault-id: vault-id }
+      (merge user-position { 
+        amount-ustx: (+ (get amount-ustx user-position) amount-ustx),
+        last-rebalance-height: stacks-block-height
+      })
+    )
+    
+    ;; Update vault total assets
+    (map-set vaults
+      { vault-id: vault-id }
+      (merge vault { 
+        total-assets-ustx: (+ (get total-assets-ustx vault) amount-ustx) 
+      })
+    )
+    
+    ;; Allocate funds according to vault strategy
+    (try! (allocate-funds vault-id tx-sender amount-ustx))
+    
+    (ok true)
+  )
+)
+
+;; Withdraw assets from a vault
+(define-public (withdraw-from-vault (vault-id uint) (amount-ustx uint))
+  (let
+    (
+      (vault (unwrap! (map-get? vaults { vault-id: vault-id }) ERR-VAULT-NOT-FOUND))
+      (user-position (unwrap! (map-get? user-vault-positions { user: tx-sender, vault-id: vault-id }) ERR-POSITION-NOT-FOUND))
+    )
+    ;; Enhanced validation
+    (asserts! (is-valid-vault-id vault-id) ERR-INVALID-PARAMETER)
+    (asserts! (is-valid-amount amount-ustx) ERR-INVALID-AMOUNT)
+    (asserts! (get is-active vault) ERR-VAULT-NOT-FOUND)
+    (asserts! (>= (get amount-ustx user-position) amount-ustx) ERR-INSUFFICIENT-FUNDS)
+    
+    ;; Withdraw from protocols according to allocation
+    (try! (deallocate-funds vault-id tx-sender amount-ustx))
+    
+    ;; Update user position
+    (map-set user-vault-positions
+      { user: tx-sender, vault-id: vault-id }
+      (merge user-position { 
+        amount-ustx: (- (get amount-ustx user-position) amount-ustx)
+      })
+    )
+    
+    ;; Update vault total assets
+    (map-set vaults
+      { vault-id: vault-id }
+      (merge vault { 
+        total-assets-ustx: (- (get total-assets-ustx vault) amount-ustx) 
+      })
+    )
+    
+    ;; Transfer STX to user
+    (try! (as-contract (stx-transfer? amount-ustx tx-sender tx-sender)))
+    
+    (ok true)
+  )
+)
+
+;; Vault Helper Functions
+
+;; Helper function to extract percentage from allocation entry
+(define-private (get-percentage (entry {
+  protocol-id: uint,
+  percentage: uint,
+}))
+  (get percentage entry)
+)
+
+;; Validate that all protocols in allocation exist and are active
+(define-private (validate-allocation (allocation (list 10 {
+  protocol-id: uint,
+  percentage: uint,
+})))
+  (fold and (map validate-protocol-in-allocation allocation) true)
+)
+
+;; Validate a single protocol in allocation
+(define-private (validate-protocol-in-allocation (entry {
+  protocol-id: uint,
+  percentage: uint,
+}))
+  (match (map-get? protocols { protocol-id: (get protocol-id entry) })
+    protocol (get is-active protocol)
+    false
+  )
+)
+
+;; Allocate funds according to vault strategy
+(define-private (allocate-funds
+    (vault-id uint)
+    (user principal)
+    (amount-ustx uint)
+  )
+  (let (
+      (vault (unwrap! (map-get? vaults { vault-id: vault-id }) ERR-VAULT-NOT-FOUND))
+      (allocation (get allocation vault))
+    )
+    ;; Distribute funds according to allocation percentages
+    (ok (distribute-to-protocols user allocation amount-ustx))
+  )
+)
+
+;; Distribute funds to protocols according to allocation
+(define-private (distribute-to-protocols
+    (user principal)
+    (allocation (list 10 {
+      protocol-id: uint,
+      percentage: uint,
+    }))
+    (total-amount-ustx uint)
+  )
+  (fold distribute-entry allocation total-amount-ustx)
+)
+
+;; Distribute a single allocation entry
+(define-private (distribute-entry
+    (entry {
+      protocol-id: uint,
+      percentage: uint,
+    })
+    (total-amount-ustx uint)
+  )
+  (let (
+      (protocol-id (get protocol-id entry))
+      (percentage (get percentage entry))
+      (amount-to-allocate (/ (* total-amount-ustx percentage) u100))
+    )
+    ;; Call the appropriate protocol adapter function
+    (mock-protocol-deposit protocol-id amount-to-allocate)
+    total-amount-ustx
+  )
+)
+
+;; Mock function for protocol deposit (would be replaced with actual protocol calls)
+(define-private (mock-protocol-deposit
+    (protocol-id uint)
+    (amount-ustx uint)
+  )
+  (begin
+    (print {
+      action: "deposit",
+      protocol-id: protocol-id,
+      amount: amount-ustx,
+    })
+    true
+  )
+)
+
+;; Deallocate funds from protocols (for withdrawal)
+(define-private (deallocate-funds
+    (vault-id uint)
+    (user principal)
+    (amount-ustx uint)
+  )
+  (let (
+      (vault (unwrap! (map-get? vaults { vault-id: vault-id }) ERR-VAULT-NOT-FOUND))
+      (allocation (get allocation vault))
+    )
+    ;; Withdraw from protocols according to allocation percentages
+    (ok (withdraw-from-protocols user allocation amount-ustx))
+  )
+)
+
+;; Withdraw funds from protocols according to allocation
+(define-private (withdraw-from-protocols
+    (user principal)
+    (allocation (list 10 {
+      protocol-id: uint,
+      percentage: uint,
+    }))
+    (total-amount-ustx uint)
+  )
+  (fold withdraw-entry allocation total-amount-ustx)
+)
+
+;; Withdraw a single allocation entry
+(define-private (withdraw-entry
+    (entry {
+      protocol-id: uint,
+      percentage: uint,
+    })
+    (total-amount-ustx uint)
+  )
+  (let (
+      (protocol-id (get protocol-id entry))
+      (percentage (get percentage entry))
+      (amount-to-withdraw (/ (* total-amount-ustx percentage) u100))
+    )
+    ;; Call the appropriate protocol adapter function
+    (mock-protocol-withdraw protocol-id amount-to-withdraw)
+    total-amount-ustx
+  )
+)
+
+;; Mock function for protocol withdrawal (would be replaced with actual protocol calls)
+(define-private (mock-protocol-withdraw
+    (protocol-id uint)
+    (amount-ustx uint)
+  )
+  (begin
+    (print {
+      action: "withdraw",
+      protocol-id: protocol-id,
+      amount: amount-ustx,
+    })
+    true
+  )
+)
+
+;; Risk Management Functions
+
+;; Set user risk preferences
+(define-public (set-risk-preferences
+    (liquidation-alert-threshold uint)
+    (rebalance-threshold uint)
+    (max-slippage uint)
+    (notification-enabled bool)
+  )
+  (begin
+    (asserts! (<= liquidation-alert-threshold u50) ERR-INVALID-PARAMETER)
+    (asserts! (<= rebalance-threshold u50) ERR-INVALID-PARAMETER)
+    (asserts! (<= max-slippage u50) ERR-INVALID-PARAMETER)
+    (map-set user-risk-settings { user: tx-sender } {
+      liquidation-alert-threshold: liquidation-alert-threshold,
+      rebalance-threshold: rebalance-threshold,
+      max-slippage: max-slippage,
+      notification-enabled: notification-enabled,
+    })
+    (ok true)
+  )
+)
+
+;; Check if a user's position needs liquidation alert
+(define-public (check-liquidation-risk (user principal) (protocol-id uint))
+  (let
+    (
+      (protocol (unwrap! (map-get? protocols { protocol-id: protocol-id }) ERR-PROTOCOL-NOT-REGISTERED))
+      (risk-params (unwrap! (map-get? protocol-risk-params { protocol-id: protocol-id }) ERR-PROTOCOL-NOT-REGISTERED))
+      (user-settings (default-to 
+                      {
+                        liquidation-alert-threshold: u5,
+                        rebalance-threshold: u10,
+                        max-slippage: u5,
+                        notification-enabled: true
+                      }
+                      (map-get? user-risk-settings { user: user })))
+      (current-ltv (mock-get-current-ltv user protocol-id))
+      (liquidation-threshold (get liquidation-threshold risk-params))
+      (alert-threshold (- liquidation-threshold (get liquidation-alert-threshold user-settings)))
+    )
+    ;; Enhanced validation
+    (asserts! (is-valid-principal user) ERR-INVALID-PARAMETER)
+    (asserts! (is-valid-protocol-id protocol-id) ERR-INVALID-PARAMETER)
+    
+    (if (>= current-ltv alert-threshold)
+      (begin
+        (print {event: "liquidation-alert", user: user, protocol-id: protocol-id, current-ltv: current-ltv, threshold: alert-threshold})
+        (ok true)
+      )
+      (ok false)
+    )
+  )
+)
+
+;; Mock function to get current LTV for a user (would be replaced with actual protocol calls)
+(define-private (mock-get-current-ltv
+    (user principal)
+    (protocol-id uint)
+  )
+  ;; For demonstration, return a fixed value
+  u70
+  ;; 70% LTV
+)
+
+;; Rebalance a vault based on market conditions
+(define-public (rebalance-vault (vault-id uint))
+  (let ((vault (unwrap! (map-get? vaults { vault-id: vault-id }) ERR-VAULT-NOT-FOUND)))
+    (asserts!
+      (or
+        (is-eq tx-sender (get creator vault))
+        (is-eq tx-sender (var-get contract-owner))
+      )
+      ERR-NOT-AUTHORIZED
+    )
+    ;; Perform the rebalancing logic
+    ;; This would involve withdrawing from underperforming protocols and depositing into better ones
+    (print {
+      event: "rebalance-vault",
+      vault-id: vault-id,
+    })
+    (ok true)
+  )
+)
+
+;; Portfolio Tracking Functions
+
+;; Update a user's position in a protocol
+(define-public (update-protocol-position
+    (protocol-id uint)
+    (supplied-assets (list 5 {token: (string-ascii 32), amount: uint}))
+    (borrowed-assets (list 5 {token: (string-ascii 32), amount: uint}))
+    (liquidity-positions (list 5 {pool-id: (string-ascii 32), amount: uint}))
+    (staked-positions (list 5 {asset: (string-ascii 32), amount: uint}))
+  )
+  (let (
+      (protocol (unwrap! (map-get? protocols { protocol-id: protocol-id }) ERR-PROTOCOL-NOT-REGISTERED))
+      (current-position (default-to {
+        supplied-assets: (list),
+        borrowed-assets: (list),
+        liquidity-positions: (list),
+        staked-positions: (list),
+        last-updated-height: u0,
+      }
+        (map-get? user-protocol-positions {
+          user: tx-sender,
+          protocol-id: protocol-id,
+        })
+      ))
+    )
+    ;; Enhanced validation for all input parameters
+    (asserts! (is-valid-protocol-id protocol-id) ERR-INVALID-PARAMETER)
+    (asserts! (get is-active protocol) ERR-INVALID-PROTOCOL)
+    (asserts! (validate-asset-list supplied-assets) ERR-INVALID-PARAMETER)
+    (asserts! (validate-asset-list borrowed-assets) ERR-INVALID-PARAMETER)
+    (asserts! (validate-pool-list liquidity-positions) ERR-INVALID-PARAMETER)
+    (asserts! (validate-stake-list staked-positions) ERR-INVALID-PARAMETER)
+    
+    (map-set user-protocol-positions {
+      user: tx-sender,
+      protocol-id: protocol-id,
+    } {
+      supplied-assets: supplied-assets,
+      borrowed-assets: borrowed-assets,
+      liquidity-positions: liquidity-positions,
+      staked-positions: staked-positions,
+      last-updated-height: stacks-block-height,
+    })
+    (ok true)
+  )
+)
+
+;; Get a user's total portfolio value (simplified version)
+(define-read-only (get-portfolio-value (user principal))
+  (let (
+      (protocol-count (var-get next-protocol-id))
+      (vault-count (var-get next-vault-id))
+    )
+    ;; Sum up the value across all protocols and vaults
+    ;; This is a simplified implementation - actual would calculate real-time values
+    (ok u0)
+    ;; Placeholder return value
+  )
+)
+
+;; Gasless Transaction Functions
+
+;; Execute a batch transaction across multiple protocols
+(define-public (execute-batch-transaction (actions (list 10 {
+  protocol-id: uint,
+  action: (string-ascii 32),
+  params: (list 5 {
+    key: (string-ascii 32),
+    value: uint,
+  }),
+})))
+  (let ((action-count (len actions)))
+    ;; Validate all actions
+    (asserts! (> action-count u0) ERR-INVALID-PARAMETER)
+    ;; Execute all actions in sequence
+    (ok (execute-actions actions))
+  )
+)
+
+;; Execute a list of actions
+(define-private (execute-actions (actions (list 10 {
+  protocol-id: uint,
+  action: (string-ascii 32),
+  params: (list 5 {
+    key: (string-ascii 32),
+    value: uint,
+  }),
+})))
+  (fold execute-single-action actions true)
+)
+
+;; Execute a single action within the batch
+(define-private (execute-single-action
+    (action {
+      protocol-id: uint,
+      action: (string-ascii 32),
+      params: (list 5 {
+        key: (string-ascii 32),
+        value: uint,
+      }),
+    })
+    (previous-result bool)
+  )
+  (let (
+      (protocol-id (get protocol-id action))
+      (action-type (get action action))
+      (params (get params action))
+    )
+    ;; Call appropriate protocol action
+    ;; This is a simplified implementation - would actually call protocol adapter contracts
+    (print {
+      execute: action-type,
+      protocol: protocol-id,
+      params: params,
+    })
+    true
+  )
+)
+
+;; Utility Functions
+
+;; Calculate APY for a vault (simplified version)
+(define-read-only (calculate-vault-apy (vault-id uint))
+  (let ((vault (unwrap! (map-get? vaults { vault-id: vault-id }) ERR-VAULT-NOT-FOUND)))
+    ;; This is a simplified implementation - would calculate based on actual returns
+    (ok (get target-apy vault))
+  )
+)
+
+;; Get all active vaults
+(define-read-only (get-active-vaults)
+  (ok u0)
+  ;; Placeholder - would return list of active vault IDs
+)
+
+;; Get vault details
+(define-read-only (get-vault-details (vault-id uint))
+  (ok (unwrap! (map-get? vaults { vault-id: vault-id }) ERR-VAULT-NOT-FOUND))
+)
+
+;; Get protocol details
+(define-read-only (get-protocol-details (protocol-id uint))
+  (ok (unwrap! (map-get? protocols { protocol-id: protocol-id })
+    ERR-PROTOCOL-NOT-REGISTERED
+  ))
+)
+
+;; Get user position in vault
+(define-read-only (get-user-vault-position
+    (user principal)
+    (vault-id uint)
+  )
+  (ok (unwrap!
+    (map-get? user-vault-positions {
+      user: user,
+      vault-id: vault-id,
+    })
+    ERR-POSITION-NOT-FOUND
+  ))
+)
+
+;; Get user protocol position
+(define-read-only (get-user-protocol-position
+    (user principal)
+    (protocol-id uint)
+  )
+  (ok (unwrap!
+    (map-get? user-protocol-positions {
+      user: user,
+      protocol-id: protocol-id,
+    })
+    ERR-POSITION-NOT-FOUND
+  ))
+)
