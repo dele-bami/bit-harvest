@@ -303,3 +303,86 @@
     (ok true)
   )
 )
+
+;; Withdraw assets from a vault
+(define-public (withdraw-from-vault
+    (vault-id uint)
+    (amount-ustx uint)
+  )
+  (let (
+      (vault (unwrap! (map-get? vaults { vault-id: vault-id }) ERR-VAULT-NOT-FOUND))
+      (user-position (unwrap!
+        (map-get? user-vault-positions {
+          user: tx-sender,
+          vault-id: vault-id,
+        })
+        ERR-POSITION-NOT-FOUND
+      ))
+    )
+    ;; Validate
+    (asserts! (get is-active vault) ERR-VAULT-NOT-FOUND)
+    (asserts! (>= (get amount-ustx user-position) amount-ustx)
+      ERR-INSUFFICIENT-FUNDS
+    )
+    ;; Withdraw from protocols according to allocation
+    (try! (deallocate-funds vault-id tx-sender amount-ustx))
+    ;; Update user position
+    (map-set user-vault-positions {
+      user: tx-sender,
+      vault-id: vault-id,
+    }
+      (merge user-position { amount-ustx: (- (get amount-ustx user-position) amount-ustx) })
+    )
+    ;; Update vault total assets
+    (map-set vaults { vault-id: vault-id }
+      (merge vault { total-assets-ustx: (- (get total-assets-ustx vault) amount-ustx) })
+    )
+    ;; Transfer STX to user
+    (try! (as-contract (stx-transfer? amount-ustx tx-sender tx-sender)))
+    (ok true)
+  )
+)
+
+;; Vault Helper Functions
+
+;; Helper function to extract percentage from allocation entry
+(define-private (get-percentage (entry {
+  protocol-id: uint,
+  percentage: uint,
+}))
+  (get percentage entry)
+)
+
+;; Validate that all protocols in allocation exist and are active
+(define-private (validate-allocation (allocation (list 10 {
+  protocol-id: uint,
+  percentage: uint,
+})))
+  (fold and (map validate-protocol-in-allocation allocation) true)
+)
+
+;; Validate a single protocol in allocation
+(define-private (validate-protocol-in-allocation (entry {
+  protocol-id: uint,
+  percentage: uint,
+}))
+  (match (map-get? protocols { protocol-id: (get protocol-id entry) })
+    protocol (get is-active protocol)
+    false
+  )
+)
+
+;; Allocate funds according to vault strategy
+(define-private (allocate-funds
+    (vault-id uint)
+    (user principal)
+    (amount-ustx uint)
+  )
+  (let (
+      (vault (unwrap! (map-get? vaults { vault-id: vault-id }) ERR-VAULT-NOT-FOUND))
+      (allocation (get allocation vault))
+    )
+    ;; Distribute funds according to allocation percentages
+    (ok (distribute-to-protocols user allocation amount-ustx))
+  )
+)
