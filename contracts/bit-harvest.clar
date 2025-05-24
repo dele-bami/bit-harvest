@@ -191,3 +191,115 @@
     (ok true)
   )
 )
+
+;; Set risk parameters for a lending protocol
+(define-public (set-protocol-risk-params
+    (protocol-id uint)
+    (liquidation-threshold uint)
+    (max-ltv uint)
+    (liquidation-penalty uint)
+    (oracle-address principal)
+  )
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+    (asserts! (is-some (map-get? protocols { protocol-id: protocol-id }))
+      ERR-PROTOCOL-NOT-REGISTERED
+    )
+    (asserts! (<= liquidation-threshold u100) ERR-INVALID-PARAMETER)
+    (asserts! (<= max-ltv liquidation-threshold) ERR-INVALID-PARAMETER)
+    (asserts! (<= liquidation-penalty u100) ERR-INVALID-PARAMETER)
+    (map-set protocol-risk-params { protocol-id: protocol-id } {
+      liquidation-threshold: liquidation-threshold,
+      max-ltv: max-ltv,
+      liquidation-penalty: liquidation-penalty,
+      oracle-address: oracle-address,
+    })
+    (ok true)
+  )
+)
+
+;; Vault Functions
+
+;; Create a new yield optimization vault
+(define-public (create-vault
+    (name (string-ascii 64))
+    (description (string-ascii 256))
+    (strategy (string-ascii 32))
+    (target-apy uint)
+    (risk-level uint)
+    (allocation (list 10 {
+      protocol-id: uint,
+      percentage: uint,
+    }))
+  )
+  (let (
+      (vault-id (var-get next-vault-id))
+      (total-percentage (fold + (map get-percentage allocation) u0))
+    )
+    ;; Validate input parameters
+    (asserts! (and (>= risk-level u1) (<= risk-level u10)) ERR-INVALID-PARAMETER)
+    (asserts! (is-eq total-percentage u100) ERR-INVALID-PARAMETER)
+    ;; Check all protocols in allocation exist and are active
+    (asserts! (validate-allocation allocation) ERR-INVALID-PROTOCOL)
+    ;; Create the vault
+    (map-set vaults { vault-id: vault-id } {
+      creator: tx-sender,
+      name: name,
+      description: description,
+      strategy: strategy,
+      target-apy: target-apy,
+      risk-level: risk-level,
+      allocation: allocation,
+      is-active: true,
+      total-assets-ustx: u0,
+      creation-height: stacks-block-height,
+    })
+    (var-set next-vault-id (+ vault-id u1))
+    (ok vault-id)
+  )
+)
+
+;; Deposit assets into a vault
+(define-public (deposit-to-vault
+    (vault-id uint)
+    (amount-ustx uint)
+  )
+  (let (
+      (vault (unwrap! (map-get? vaults { vault-id: vault-id }) ERR-VAULT-NOT-FOUND))
+      (user-position (default-to {
+        amount-ustx: u0,
+        entry-height: stacks-block-height,
+        last-rebalance-height: stacks-block-height,
+        earnings-ustx: u0,
+        strategy-params: none,
+      }
+        (map-get? user-vault-positions {
+          user: tx-sender,
+          vault-id: vault-id,
+        })
+      ))
+    )
+    ;; Validate
+    (asserts! (get is-active vault) ERR-VAULT-NOT-FOUND)
+    (asserts! (> amount-ustx u0) ERR-INVALID-AMOUNT)
+    ;; Transfer STX to contract
+    (try! (stx-transfer? amount-ustx tx-sender (as-contract tx-sender)))
+    ;; Update user position
+    (map-set user-vault-positions {
+      user: tx-sender,
+      vault-id: vault-id,
+    }
+      (merge user-position {
+        amount-ustx: (+ (get amount-ustx user-position) amount-ustx),
+        last-rebalance-height: stacks-block-height,
+      })
+    )
+    ;; Update vault total assets
+    (map-set vaults { vault-id: vault-id }
+      (merge vault { total-assets-ustx: (+ (get total-assets-ustx vault) amount-ustx) })
+    )
+    ;; Allocate funds according to vault strategy
+    (try! (allocate-funds vault-id tx-sender amount-ustx))
+    (ok true)
+  )
+)
