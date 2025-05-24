@@ -386,3 +386,110 @@
     (ok (distribute-to-protocols user allocation amount-ustx))
   )
 )
+
+;; Distribute funds to protocols according to allocation
+(define-private (distribute-to-protocols
+    (user principal)
+    (allocation (list 10 {
+      protocol-id: uint,
+      percentage: uint,
+    }))
+    (total-amount-ustx uint)
+  )
+  (fold distribute-entry allocation total-amount-ustx)
+)
+
+;; Distribute a single allocation entry
+(define-private (distribute-entry
+    (entry {
+      protocol-id: uint,
+      percentage: uint,
+    })
+    (total-amount-ustx uint)
+  )
+  (let (
+      (protocol-id (get protocol-id entry))
+      (percentage (get percentage entry))
+      (amount-to-allocate (/ (* total-amount-ustx percentage) u100))
+    )
+    ;; Call the appropriate protocol adapter function
+    (mock-protocol-deposit protocol-id amount-to-allocate)
+    total-amount-ustx
+  )
+)
+
+;; Mock function for protocol deposit (would be replaced with actual protocol calls)
+(define-private (mock-protocol-deposit
+    (protocol-id uint)
+    (amount-ustx uint)
+  )
+  (begin
+    (print {
+      action: "deposit",
+      protocol-id: protocol-id,
+      amount: amount-ustx,
+    })
+    true
+  )
+)
+
+;; Deallocate funds from protocols (for withdrawal)
+(define-private (deallocate-funds
+    (vault-id uint)
+    (user principal)
+    (amount-ustx uint)
+  )
+  (let (
+      (vault (unwrap! (map-get? vaults { vault-id: vault-id }) ERR-VAULT-NOT-FOUND))
+      (allocation (get allocation vault))
+    )
+    ;; Withdraw from protocols according to allocation percentages
+    (ok (withdraw-from-protocols user allocation amount-ustx))
+  )
+)
+
+;; Withdraw funds from protocols according to allocation
+(define-private (withdraw-from-protocols
+    (user principal)
+    (allocation (list 10 {
+      protocol-id: uint,
+      percentage: uint,
+    }))
+    (total-amount-ustx uint)
+  )
+  (fold withdraw-entry allocation total-amount-ustx)
+)
+
+;; Withdraw a single allocation entry
+(define-private (withdraw-entry
+    (entry {
+      protocol-id: uint,
+      percentage: uint,
+    })
+    (total-amount-ustx uint)
+  )
+  (let (
+      (protocol-id (get protocol-id entry))
+      (percentage (get percentage entry))
+      (amount-to-withdraw (/ (* total-amount-ustx percentage) u100))
+    )
+    ;; Call the appropriate protocol adapter function
+    (mock-protocol-withdraw protocol-id amount-to-withdraw)
+    total-amount-ustx
+  )
+)
+
+;; Mock function for protocol withdrawal (would be replaced with actual protocol calls)
+(define-private (mock-protocol-withdraw
+    (protocol-id uint)
+    (amount-ustx uint)
+  )
+  (begin
+    (print {
+      action: "withdraw",
+      protocol-id: protocol-id,
+      amount: amount-ustx,
+    })
+    true
+  )
+)
