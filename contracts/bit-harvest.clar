@@ -587,3 +587,101 @@
     (ok true)
   )
 )
+
+;; Portfolio Tracking Functions
+
+;; Update a user's position in a protocol
+(define-public (update-protocol-position
+    (protocol-id uint)
+    (supplied-assets (list 5 {
+      token: (string-ascii 32),
+      amount: uint,
+    }))
+    (borrowed-assets (list 5 {
+      token: (string-ascii 32),
+      amount: uint,
+    }))
+    (liquidity-positions (list 5 {
+      pool-id: (string-ascii 32),
+      amount: uint,
+    }))
+    (staked-positions (list 5 {
+      asset: (string-ascii 32),
+      amount: uint,
+    }))
+  )
+  (let (
+      (protocol (unwrap! (map-get? protocols { protocol-id: protocol-id })
+        ERR-PROTOCOL-NOT-REGISTERED
+      ))
+      (current-position (default-to {
+        supplied-assets: (list),
+        borrowed-assets: (list),
+        liquidity-positions: (list),
+        staked-positions: (list),
+        last-updated-height: u0,
+      }
+        (map-get? user-protocol-positions {
+          user: tx-sender,
+          protocol-id: protocol-id,
+        })
+      ))
+    )
+    (asserts! (get is-active protocol) ERR-INVALID-PROTOCOL)
+    (map-set user-protocol-positions {
+      user: tx-sender,
+      protocol-id: protocol-id,
+    } {
+      supplied-assets: supplied-assets,
+      borrowed-assets: borrowed-assets,
+      liquidity-positions: liquidity-positions,
+      staked-positions: staked-positions,
+      last-updated-height: stacks-block-height,
+    })
+    (ok true)
+  )
+)
+
+;; Get a user's total portfolio value (simplified version)
+(define-read-only (get-portfolio-value (user principal))
+  (let (
+      (protocol-count (var-get next-protocol-id))
+      (vault-count (var-get next-vault-id))
+    )
+    ;; Sum up the value across all protocols and vaults
+    ;; This is a simplified implementation - actual would calculate real-time values
+    (ok u0)
+    ;; Placeholder return value
+  )
+)
+
+;; Gasless Transaction Functions
+
+;; Execute a batch transaction across multiple protocols
+(define-public (execute-batch-transaction (actions (list 10 {
+  protocol-id: uint,
+  action: (string-ascii 32),
+  params: (list 5 {
+    key: (string-ascii 32),
+    value: uint,
+  }),
+})))
+  (let ((action-count (len actions)))
+    ;; Validate all actions
+    (asserts! (> action-count u0) ERR-INVALID-PARAMETER)
+    ;; Execute all actions in sequence
+    (ok (execute-actions actions))
+  )
+)
+
+;; Execute a list of actions
+(define-private (execute-actions (actions (list 10 {
+  protocol-id: uint,
+  action: (string-ascii 32),
+  params: (list 5 {
+    key: (string-ascii 32),
+    value: uint,
+  }),
+})))
+  (fold execute-single-action actions true)
+)
